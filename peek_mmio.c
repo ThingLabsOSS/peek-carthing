@@ -156,14 +156,22 @@ static int __init peek_init(void)
 	 * MIDR / dmesg above. Reboot reason needs SMC mediation, which we
 	 * skip for now since we don't have a known SMC ID for it. */
 
-	dump_block("HHI clock controller — full (PLLs, dividers, video clks)",
-		   HHI_BASE, 0x800);
+	dump_block("HHI clock controller (PLLs, dividers, MIPI clk cntl)",
+		   HHI_BASE, 0x400);
 	dump_block("MHU mailbox (SCP coprocessor IPC)",     0xff63c400, 0x80);
 	dump_block("DMC / DDR controller",                  0xff638000, 0x200);
-	dump_block("Mali Bifrost GPU (id, freq, status)",   0xffe40000, 0x100);
-	dump_block("eMMC controller (mmc@ffe07000)",        0xffe07000, 0x100);
-	dump_block("Audio bus (PDM mics, TDM)",             0xff642000, 0x200);
-	dump_block("PWM EF (separate from BL_PWM AB)",      0xffd19000, 0x40);
+	dump_block("Mali Bifrost GPU (Mali-G31 product 0x7093, id/freq/status)",
+		   0xffe40000, 0x100);
+	dump_block("eMMC controller (mmc@ffe07000) — live bus state",
+		   0xffe07000, 0x100);
+	dump_block("Audio bus (PDM mics, TDM, TODDR ringbufs)",
+		   0xff642000, 0x200);
+	dump_block("t9015 internal audio codec",            0xff632000, 0x100);
+	dump_block("PWM EF",                                0xffd19000, 0x40);
+	dump_block("AO bus PWM (separate from CBUS PWM)",   0xff802000, 0x40);
+	dump_block("DWC3 USB3 controller (events, GSTS)",   0xff500000, 0x100);
+	dump_block("USB2 PHY (ffe09000)",                   0xffe09000, 0x80);
+	dump_block("Reset controller",                      0xff634404, 0x40);
 	dump_block("VPU near-ENCL (display timing block)",
 		   VPU_BASE + 0x7000, 0x500);
 	dump_block("DSI host (DWC + Amlogic TOP wrapper)",
