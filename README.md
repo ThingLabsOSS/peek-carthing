@@ -1,116 +1,221 @@
-# peek_carthing — deep Linux hardware inventory for the Car Thing
+# peek-carthing — deep hardware inventory for the Spotify Car Thing
 
-One-shot Linux kernel module that dumps **everything we can read** about
-the Car Thing's hardware state. Companion to the u-boot-side `hwinfo`
-command but pulls way more data because Linux has APIs we don't in
-u-boot (SMC, thermal framework, I2C subsystem, regulator/clock summary,
-DRM debugfs, etc).
+Drop-in tool that produces a single ~275 KB JSON document describing
+**every piece of hardware state we can read** on a running Car Thing.
 
-## What you get
-
-Output via `/proc/peek_carthing` (also dumped to dmesg on load):
-
-1. **System summary** — kernel build, RAM, uptime, loadavg, machine type
-2. **SoC identity** — `MIDR_EL1` decoded into impl/arch/variant/part/rev,
-   `AO_SEC_GP_CFG0` boot-source decode
-3. **AO sticky regs** — full 16-slot scratch + GP CFG dump (reboot reason
-   sits in `CFG15`, calibration trim in `CFG10/12`)
-4. **eFuse user area** — up to 256 bytes via secure-monitor SMC. Tries
-   vendor SMC ID `0x82000030` first, then mainline `0x82000041`. Highlights
-   `usid` (offset 18, 16 ASCII) and `f_serial` (offset 34, 15 ASCII).
-5. **HHI clock tree** — raw 1 KiB dump including all G12A PLLs, video
-   clock divider regs, MIPI PHY clock control, tsensor clock control
-6. **SARADC** — register block dump + sysfs path hint for cooked values
-7. **Tsensors** — PLL + DDR raw config/status registers
-8. **VPU near-ENCL** — 1.25 KiB around the display-timing block. Includes
-   `ENCL_VIDEO_MAX_PXCNT/LNCNT`, `HAVON_BEGIN/END`, `VAVON_BLINE/ELINE`,
-   `HSO_END`, `VSO_ELINE` — i.e. live h/v_active, htotal, vtotal,
-   hsync/vsync widths
-9. **DSI host** — full DWC core + Amlogic TOP wrapper register dump
-10. **MIPI DPHY** — digital block (usually all zeros — clocking is HHI-side)
-    plus the analog `MIPI_CNTL0..CNTL2` triplet that controls dphy lane bias
-11. **Pinmux / GPIO state** — `PERIPHS_PINMUX` (16-bank pad function
-    select), `AOBUS_PINMUX`, and the actual GPIO input/output state
-    registers for banks BOOT/A/C/H/Z. Lets you correlate what every pin
-    is muxed to vs its current level.
-12. **USB phy** — PHY21 control block. Tells you if VBUS is detected,
-    which mode the OTG is in, etc.
-13. **PWM** — PWM AB block (BL_PWM channel A drives the backlight)
-14. **I2C bus survey** — for buses 0..7, lists every address that ACKs.
-    Then dumps register windows for known chips:
-      - `MAX14656` (charger detector @ 0x35 on bus 2): regs 0x00..0x09
-      - `TMD2772` (prox/ALS @ 0x39 on bus 2): regs 0x00..0x1f
-      - `TLSC6X` (touch + panel-variant probe @ 0x2e on bus 0): regs 0x00..0x3f
-      - Apple MFi auth chip @ 0x10 on bus 3: version reg only (full
-        cert/serial dump lives in u-boot `mfi` command — needs ~500 ms
-        of SMBus dance that's awkward from a procfs read handler)
-15. **eMMC sysfs hint** — paths to `manfid`/`cid`/`csd`/`name`/`oemid`
-    and the debugfs EXT_CSD dump
-16. **DRM/KMS hints** — `/sys/kernel/debug/dri/0/state` and friends
-17. **Thermal zones** — every registered zone + current temp
-18. **Other introspection sources** — clk_summary, regulator_summary,
-    pinmux-pins, gpio, iio, pwm, backlight, drm
-
-## Building
-
-```bash
-# 1) Get kernel sources for the target. For mainline-based ports:
-git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
-# (then configure + make modules_prepare for aarch64)
-
-# 2) Build the module against those headers
-make KDIR=/path/to/linux ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-
-# Result: peek_carthing.ko
+```
+{
+  "meta": {...},
+  "system":   {...},   "soc":      {...},   "memory":   {...},
+  "thermal":  {...},   "iio":      {...},   "emmc":     {...},
+  "i2c":      {...},   "drm":      {...},   "modules":  {...},
+  "usb":      {...},   "net":      {...},   "gpu_sysfs":{...},
+  "debugfs":  {...},   "block":    {...},   "proc":     {...},
+  "processes":{...},   "dtb":      {...},   "kmod_mmio":{...}
+}
 ```
 
-Native build on the device works too if you have a kernel-headers
-package installed:
+Sample output: [`sample-hwinfo.json`](sample-hwinfo.json) (275 KB, real
+capture from a running stock Car Thing).
+
+Interpretation of what the JSON reveals: [`findings.md`](findings.md).
+
+## Two pieces
+
+| file | what it does |
+|---|---|
+| **`peek_mmio.ko`** | Kernel module. Dumps MMIO register blocks that userspace can't reach — HHI clock controller, VPU/ENCL display block, DSI host, Mali GPU, DDR controller, eMMC controller, audio bus, MIPI DPHY bias. Stock kernel has `CONFIG_DEVMEM=n`, so /dev/mem is gone; the module is the only way to get raw register state. |
+| **`peek-collect.py`** | Python aggregator. Runs on the device, walks /proc + /sys + i2c-tools + DRM debugfs, loads `peek_mmio.ko` and parses its dmesg output (decoding known registers into typed fields), spits one JSON document. |
+
+## Quick start (pre-built, easiest)
+
+Download the kmod + script from the latest release:
 
 ```bash
-make   # uses /lib/modules/$(uname -r)/build by default
+# on your host
+gh release download --repo ThingLabsOSS/peek-carthing --pattern '*.ko' --pattern '*.py'
+
+# push to the device
+adb push peek_mmio.ko peek-collect.py /tmp/
+
+# run + pull the JSON back
+adb shell 'python3 /tmp/peek-collect.py > /tmp/hwinfo.json'
+adb pull /tmp/hwinfo.json
 ```
 
-## Loading
+That's it — `hwinfo.json` is in your cwd. Takes ~5 seconds total. The
+kmod and script auto-coordinate: the python script tries to insmod, and
+if the kmod is already loaded (it's `[permanent]` so it persists across
+the boot), it just parses the existing dmesg.
+
+## Quick-look stats from the JSON
 
 ```bash
-insmod peek_carthing.ko
-cat /proc/peek_carthing | tee hwinfo.txt   # also goes to dmesg
-
-# when done:
-rmmod peek_carthing
+# any modern jq install
+jq '.soc.midr_decoded.part, .thermal.zones[].temp_c' hwinfo.json
+jq '.kmod_mmio.sections | keys' hwinfo.json
+jq '.kmod_mmio.sections["VPU near-ENCL (display timing block) @ 0xff907000 (1280 B)"].panel_timing' hwinfo.json
 ```
 
-The module exposes `/proc/peek_carthing` for repeated reads. Each read
-re-runs the full dump (so you get fresh thermal / clock / sysfs state).
+The interesting decoded fields all live under `.kmod_mmio.sections[...]`:
+each section has a `.raw` map (register hex grid) plus optional decoded
+sub-objects like `panel_timing`, `mipi_dphy_bias`, `gpu_id`, `pdm_toddr`.
+
+## Building from source
+
+For the kmod you need a kernel build tree matching the running kernel.
+
+### Option A: Joey's spotify-kernel (recommended)
+
+[`JoeyEamigh/spotify-kernel`](https://github.com/JoeyEamigh/spotify-kernel)
+ships the Car Thing's kernel-common source with `superbird_defconfig` and a
+crosstool-NG-built GCC 6 toolchain that matches the original stock build.
+
+```bash
+git clone --depth 1 https://github.com/JoeyEamigh/spotify-kernel.git
+cd spotify-kernel
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     HOSTCFLAGS="-fcommon -Wno-error" \
+     KCFLAGS="-Wno-error" \
+     superbird_defconfig
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     HOSTCFLAGS="-fcommon -Wno-error" \
+     KCFLAGS="-Wno-error" \
+     -j$(nproc) vmlinux modules
+# vmlinux link may fail at the very end (undefined of_resolve_phandles in
+# aml_bl_load_overlay) — that's harmless. Module.symvers is what matters
+# and it's already been generated by modpost.
+```
+
+Then build the module against it:
+
+```bash
+cd /path/to/peek-carthing
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     KDIR=/path/to/spotify-kernel
+aarch64-linux-gnu-strip --strip-unneeded peek_mmio.ko
+```
+
+### Option B: any other matching kernel source
+
+`spsgsb/kernel-common` works too, with the same flags. The key
+requirement is that `Module.symvers` exists in the kernel tree before
+you build the module (run a full `make modules` once).
+
+### Patch the module_layout CRC to stock's value
+
+This is the trick that makes the kmod loadable on the stock kernel:
+out-of-tree builds produce a `module_layout` CRC that doesn't match the
+stock kernel's, but we can post-link-patch the `__versions` section to
+use stock's known-good CRC (harvested from `mali.ko`):
+
+```python
+import struct, subprocess
+
+KO = "peek_mmio.ko"
+subprocess.run(["aarch64-linux-gnu-objcopy", "--dump-section",
+                "__versions=/tmp/v.bin", KO], check=True)
+data = bytearray(open("/tmp/v.bin", "rb").read())
+for i in range(0, len(data), 64):
+    name = bytes(data[i+8:i+64]).split(b"\x00", 1)[0].decode("ascii", "replace")
+    if name == "module_layout":
+        struct.pack_into("<I", data, i, 0x8b79d6c0)  # stock kernel CRC
+open("/tmp/v.bin", "wb").write(bytes(data))
+subprocess.run(["aarch64-linux-gnu-objcopy", "--update-section",
+                "__versions=/tmp/v.bin", KO], check=True)
+```
+
+This step is **not** needed if you're loading the module on a kernel you
+built yourself (CRCs will already match).
+
+## Running it
+
+```bash
+adb push peek_mmio.ko    /tmp/peek_mmio.ko
+adb push peek-collect.py /tmp/peek-collect.py
+adb shell python3 /tmp/peek-collect.py > hwinfo.json
+```
+
+If you want just the raw dmesg dump (no JSON aggregation):
+
+```bash
+adb shell insmod /tmp/peek_mmio.ko
+adb shell 'dmesg | grep peek_mmio:'
+```
+
+The module **returns -EBUSY from init by design** so it doesn't stay
+loaded — it's a one-shot dumper. The cost: `lsmod` will show it as
+`[permanent] Loading` until the next reboot, and re-running `insmod`
+gets "Device or resource busy". The python script handles this
+automatically (it re-parses dmesg from the previous run).
+
+## What's in each MMIO section the kmod dumps
+
+| section | addr | size | what's inside |
+|---|---|---|---|
+| HHI clock controller | `0xff63c000` | 1 KiB | All G12A PLLs, video clock dividers, **MIPI analog DPHY bias** at `+0x000..0x008` (`MIPI_CNTL0/1/2`), tsensor clk, MIPI DSI phy clk |
+| MHU mailbox | `0xff63c400` | 128 B | SCP coprocessor IPC (usually idle = all zero) |
+| DMC / DDR controller | `0xff638000` | 512 B | **Per-byte-lane DLL training** at +0x180..+0x1f0 (different across RAM vendors) |
+| Mali Bifrost GPU | `0xffe40000` | 256 B | GPU_ID, shader count, power state. Decoded → product name |
+| eMMC controller | `0xffe07000` | 256 B | `SD_EMMC_CLOCK`, `SD_EMMC_CFG` — live bus speed, mode, bus width |
+| Audio bus | `0xff642000` | 512 B | **Live PDM mic TODDR ringbuffer addresses** in DRAM — write pointer advances real-time |
+| t9015 audio codec | `0xff632000` | 256 B | Internal analog DAC (unused on Car Thing — no jack) |
+| PWM AB / PWM EF | `0xffd1b000`, `0xffd19000` | 64 B each | Backlight PWM channel A is at PWM AB |
+| AO bus PWM | `0xff802000` | 64 B | Separate AO-domain PWM block |
+| VPU near-ENCL | `0xff907000` | 1.25 KiB | **Display timing**: htotal/vtotal/hsync/vsync, framebuffer pointer, OSD compositor state |
+| DSI host | `0xffd07000` | 1 KiB | DWC DSI v1.21 host + Amlogic TOP wrapper |
+| MIPI digital DPHY | `0xffd44000` | 256 B | (usually all zero — clocking is HHI-side on G12A) |
+| Pinmux / GPIO state | `0xff634480`, `0xff634440` | 512 B each | Pad function select + live GPIO levels |
+| SARADC | `0xff809000` | 64 B | Raw ADC regs (decoded values via IIO sysfs) |
+| USB2 PHY21 / USB2 PHY | `0xff63a000`, `0xffe09000` | small | USB phy state + tuning |
+| DWC3 USB3 controller | `0xff500000` | 256 B | USB3 events, GSTS, link status |
+| Reset controller | `0xff634404` | 64 B | Per-peripheral reset state |
+| Tsensors | inline | 16 B | PLL + DDR thermal sensor raw cfg/stat |
 
 ## Known limitations
 
-- **eMMC EXT_CSD direct read isn't implemented.** Doing the
-  `mmc_get_card` + `mmc_send_ext_csd` dance from a procfs read handler
-  would block on the host mutex if the FS is busy. Easier to read from
-  sysfs/debugfs in userspace.
-- **Some MMIO blocks may EBUSY** if a driver has already claimed them
-  with `request_mem_region`. `ioremap` itself succeeds (no exclusivity
-  check), but if you see "ioremap failed" in the output, that region is
-  exclusively held by another driver. Workaround: `rmmod` that driver
-  before running peek_carthing, or read via the driver's own debugfs.
-- **SMC eFuse read may fail on vendor BL31** if it requires a different
-  function ID than the two we try. The fallback chain covers the two
-  ID conventions I know of (vendor `0x82000030`, mainline `0x82000041`).
-- **I2C bus numbering** depends on DT aliases. The known-chip dumps
-  assume mainline DT numbering (`i2c0=touch, i2c2=charger+prox,
-  i2c3=MFi`); on vendor kernel the buses may be at different indices.
-  The survey loop probes 0..7 so you can find them either way.
+- **Stock kernel `CONFIG_MODULE_FORCE_LOAD=n`** — IGNORE_MODVERSIONS via
+  `finit_module` returns `-ENOEXEC`. The CRC patch above is the only path
+  that works.
+- **AO_SEC_SD_CFG / AO_SEC_GP_CFG** are intentionally skipped — they're
+  secure-world-only on G12A and reading from EL1 = sync abort + kernel
+  oops. The boot source / reboot reason fields live in `/proc/cmdline`
+  via bootargs Spotify u-boot injects.
+- **eFuse SMC reads are skipped** — stock BL31 doesn't respond to vendor
+  SMC IDs `0x82000030` / `0x82000041`, calling them hangs the CPU and
+  leaves the kmod permanently stuck. Get `usid` / `f_serial` from
+  `/proc/cmdline` or via `fastboot oem run printenv` if you're running
+  a custom u-boot.
+- **`/dev/mem` is disabled** on the stock kernel (`CONFIG_DEVMEM=n`),
+  which is why we need the kmod at all.
 
-## Adjusting for your kernel
+Full debug session that solved these:
+[`carthing_kmod_load_quirks.md`](https://github.com/lmore377/.claude-memory/blob/main/carthing_kmod_load_quirks.md).
 
-If you find the I2C buses are numbered differently, edit the bus_nr
-arguments in `dump_i2c_bus_survey()` at the bottom of `peek_carthing.c`.
+## What's NOT in the JSON (intentional, get via separate tools)
 
-If you want to add more register blocks: copy the pattern of
-`dump_hhi()` etc — `peek_iomem(m, "label", PHYS_ADDR, SIZE)` does the
-ioremap-dump-iounmap dance for you.
+- Vendor BL2 / FIP body bytes — use [`superbird-fip-tools/aml_decrypt.py`](https://github.com/ThingLabsOSS/superbird-fip-tools)
+- u-boot CLI bootmenu fields (per-panel ST7701S init etc) — use the
+  fastboot oem-run path on a unit running [`superbird-uboot`](https://github.com/lmore377/superbird-uboot)
+- eMMC EXT_CSD bytes — `cat /sys/kernel/debug/mmc*/mmc*:*/ext_csd`
+  directly works (we only print the path hint in the JSON to avoid
+  blocking on the host mutex)
+
+## Project layout
+
+```
+peek-carthing/
+├── peek_mmio.c                       — the kmod source (~7 KB)
+├── peek_carthing.c                   — full-feature kmod (mainline kernel use)
+├── peek-collect.py                   — JSON aggregator
+├── peek-userspace.sh                 — older plain-text dumper (still works)
+├── force_insmod.c                    — finit_module wrapper (kept for ref)
+├── Makefile, Makefile.full           — build configs
+├── sample-hwinfo.json                — example output, 275 KB
+├── sample-output-stock-4.9.113.txt   — raw dmesg, 498 lines
+├── findings.md                       — what the data reveals
+└── README.md                         — this file
+```
 
 ## License
 
