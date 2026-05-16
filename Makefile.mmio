@@ -1,0 +1,22 @@
+# Build for the minimal MMIO-only peek_mmio.ko variant.
+# Designed for stock vendor kernels where the full peek_carthing.ko
+# CRC-mismatches too many symbols to be loadable.
+#
+# Removes -pg to avoid pulling in _mcount (which stock buildroot kernels
+# don't export). Tolerates missing attribute consistency from the kernel
+# module init macro plumbing on modern GCC.
+
+obj-m := peek_mmio.o
+
+ccflags-y += -Wno-error=missing-attributes
+ccflags-remove-y += -pg
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+.PHONY: all clean

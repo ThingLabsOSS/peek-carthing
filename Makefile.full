@@ -1,0 +1,37 @@
+# Out-of-tree build for the peek_carthing kmod.
+#
+# Cross-compile (typical: build on host, target aarch64 Linux):
+#   make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+#        KDIR=/path/to/linux-source/built-for-target
+#
+# Native build on the device (slow; needs full kernel-headers package):
+#   make KDIR=/lib/modules/$(shell uname -r)/build
+#
+# Result: peek_carthing.ko — copy to device, `insmod peek_carthing.ko`,
+# then `cat /proc/peek_carthing | tee /tmp/hwinfo.txt`.
+
+obj-m := peek_carthing.o
+
+# Modern GCC (12+) is stricter about `cold` attribute consistency between
+# aliased functions than the kernel's module init/exit macros set up.
+# Suppress the warning so we can build a 4.9-era kernel module with GCC
+# 14+. Doesn't affect runtime behavior; just appeases the compiler.
+ccflags-y += -Wno-error=missing-attributes
+
+# Default to the running kernel's headers on the build host. Override
+# KDIR= when cross-compiling for the Car Thing target kernel.
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+# Convenience: copy + load on a device reachable over ssh as $(DEV).
+DEV ?= carthing.lan
+install: all
+	scp peek_carthing.ko root@$(DEV):/tmp/
+	ssh root@$(DEV) 'insmod /tmp/peek_carthing.ko && cat /proc/peek_carthing'
+
+.PHONY: all clean install
