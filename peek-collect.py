@@ -427,7 +427,7 @@ def collect_i2c():
             parts = line.split()
             if not parts or not parts[0].endswith(":"):
                 continue
-            row = int(parts[0].rstrip(":"), 16) * 16
+            row = int(parts[0].rstrip(":"), 16)
             for i, cell in enumerate(parts[1:17] if len(parts) > 1 else []):
                 if cell != "--":
                     addr = row + i
@@ -852,15 +852,48 @@ def load_kmod_and_collect():
 # main
 # -----------------------------------------------------------------------
 
+def read_device_serial():
+    """Read the device's factory-fused serial.
+
+    The serial is the same value across kernels and lives in efuse; what
+    differs is the path the kernel exposes it under. Return the first
+    source that produces a non-empty string.
+
+    - mainline + bridgething with nvmem efuse cells configured exposes
+      the 12-byte Spotify-printed serial (e.g. "8558R481Q61R") at
+      /sys/bus/nvmem/devices/efuse0/cells/serial-number@12,0
+    - mainline u-boot may also surface it as a DT root property at
+      /proc/device-tree/serial-number
+    - stock 4.9 (Amlogic vendor) exposes the same value via the vendor
+      efuse sysfs class at /sys/class/efuse/usid
+
+    Some installs additionally expose the SoC-level efuse serial via
+    /proc/cpuinfo, but that's stock-only and a different format; we
+    don't use it here to keep the canonical key consistent across
+    kernels.
+    """
+    sources = (
+        "/sys/bus/nvmem/devices/efuse0/cells/serial-number@12,0",
+        "/proc/device-tree/serial-number",
+        "/sys/class/efuse/usid",
+    )
+    for path in sources:
+        raw = slurp(path) or ""
+        s = raw.strip().rstrip("\x00").strip()
+        if s and not s.startswith("\x00"):
+            return s
+    return None
+
+
 def main():
-    serial = (slurp("/proc/device-tree/serial-number") or "").strip().rstrip("\x00")
+    serial = read_device_serial()
 
     doc = {
         "meta": {
             "tool": TOOL_NAME,
             "version": VERSION,
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "device_serial": serial or None,
+            "device_serial": serial,
         },
         "system":       collect_system(),
         "soc":          collect_soc(),
